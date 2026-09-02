@@ -1,0 +1,27 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+TestResults/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+appsettings.*.local.json
+
+# Docs build
+site/
+
+# Node (docs tooling, if any)
+node_modules/
