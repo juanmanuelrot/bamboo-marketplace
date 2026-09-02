@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-02
 **Status:** Draft for review
-**License:** open source (MIT, to be confirmed)
+**License:** MIT
 
 ## 1. Problem
 

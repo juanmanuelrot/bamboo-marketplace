@@ -23,4 +23,4 @@ Design phase. The current design is in [`docs/superpowers/specs/2026-09-02-bambo
 
 ## License
 
-Open source. License to be chosen before the first release.
+[MIT](LICENSE).
