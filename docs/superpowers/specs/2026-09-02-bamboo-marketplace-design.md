@@ -29,6 +29,20 @@ The service is **not PCI compliant** and never touches card data. Card capture h
 - All payouts, to sub-merchants and to the marketplace, are executed from the payouts account.
 - Billing Movements (Bamboo's account-side ledger) can be queried for **each account**, payins and payouts, per country, using that account's own credentials. So the service sees both sides of every movement, including the manual transfer and payout fees.
 
+- The payouts account is itself a v3 merchant account: the merchant balance endpoint and Billing Movements answer with the payouts account's private key.
+
+### 2.1 Observed in production (Peru, 2026-09-02)
+
+Facts taken from real responses, which override the public documentation where they differ:
+
+- **Merchant balance** returns `{ "BalanceSummary": [ { Currency, TotalSettlement, TotalAvailable, TotalProcessing } ] }` with amounts as **decimals in major units with 4 decimal places** (e.g. `559.6822`). `TotalSettlement` is money settled but not yet available; `TotalAvailable` is payable now. Rounding noise exists (`TotalAvailable: -0.0035`).
+- **Billing Movements** returns `{ "Response": { Data, Page, PageSize, Total }, "Errors" }` with amounts as **integer minor units** (`2000` = 20.00 PEN), debits negative. Field casing differs from the docs (`Transactionid`, `Movementid`, `Availabledate`, `Referenceid`, `Exchangerate`): deserialization must be case-insensitive.
+- Every approved purchase produces **one `Purchase` credit row and two `TrafficFee` debit rows** (a fixed component and a percentage component), all sharing the purchase's `Transactionid` and `Created`, all with the same `Availabledate`.
+- `Availabledate` was `Created + 4 calendar days` for Yape, debit and credit card alike.
+- `Referenceid` is empty; the merchant's `Order` does not appear in Billing Movements. Matching is by `Transactionid` only.
+- `Payment_method` and `Payment_media_brand` are sometimes swapped; neither is used for anything.
+- Minimum data latency is one hour.
+
 Everything in this design follows from those facts.
 
 ## 3. Decisions taken
@@ -133,8 +147,8 @@ Notation: Dr = debit, Cr = credit. Example: gross 10000, commission 5%, sub-merc
 **`payment.approved`**
 Dr `bamboo.payins` 10000 · Cr `submerchant.X.pending` 9500 · Cr `marketplace.pending` 500
 
-**`payment.bamboo_fee`** (from Billing Movements `TrafficFee`, e.g. 350)
-Cr `bamboo.payins` 350 · Dr `submerchant.X.pending` 350 (bearer = submerchant) **or** Dr `marketplace.pending` 350 (bearer = marketplace)
+**`payment.bamboo_fee`** (one per `TrafficFee` row; a purchase normally has two, e.g. 24 + 326)
+Cr `bamboo.payins` · Dr `submerchant.X.pending` (bearer = submerchant) **or** Dr `marketplace.pending` (bearer = marketplace). If the payment has already been released, the debit goes to the bearer's `available` instead, so a late fee row never needs special handling.
 
 **`payment.released`** (funds available at Bamboo)
 Dr `submerchant.X.pending` 9150 · Cr `submerchant.X.available` 9150
@@ -194,9 +208,11 @@ Checked by the reconciliation job and by tests, per `(marketplace, country, curr
 
 1. Every entry's postings sum to zero.
 2. `account_balances` equals `SUM(postings)` per account.
-3. `bamboo.payins` equals the payins account balance Bamboo reports (settlement + available + processing).
-4. `bamboo.payouts` equals the payouts account balance Bamboo reports (total + processing).
+3. `bamboo.payins` equals the payins account balance Bamboo reports (`TotalSettlement + TotalAvailable + TotalProcessing`). Additionally, the sum of all `*.pending` balances equals `TotalSettlement`, and the sum of all `*.available + *.reserved` balances plus `suspense` equals `TotalAvailable`.
+4. `bamboo.payouts` equals the payouts account balance Bamboo reports.
 5. `bamboo.payins + bamboo.payouts` = sum of all liability accounts.
+
+Bamboo balances are converted from 4-decimal major units to minor units and compared with a tolerance of 1 minor unit per currency, because Bamboo's own figures carry rounding noise.
 
 ### 5.6 Derived reports
 
@@ -249,7 +265,7 @@ Payouts side:
 
 Bamboo's exact `Type` values on the payouts side are open question 4 in §16; the mapping is configuration, not code.
 
-**Step 3 — Release.** A payment moves `pending → available` (entry `payment.released`) only when all three hold: confirmed by Bamboo in Billing Movements, its fee entry exists, and `AvailableDate ≤ now`. If `AvailableDate + grace period` has passed and any condition is still false, open issue `release_blocked` with the exact missing condition. Nothing is released without evidence.
+**Step 3 — Release.** A payment moves `pending → available` (entry `payment.released`) only when all three hold: its `Purchase` row is confirmed in Billing Movements, at least one `TrafficFee` row for it has been posted, and `Availabledate ≤ now`. The release amount is the payment's net of every fee posted so far; any fee row that appears later debits `available` directly (§5.3). If `Availabledate + grace period` has passed and any condition is still false, open issue `release_blocked` with the exact missing condition. Nothing is released without evidence.
 
 **Step 4 — Check.** Query both Bamboo balances for the account and compare against the ledger: invariants 2, 3 and 4 from §5.5. Any difference opens `balance_mismatch` with the delta and both figures. Also verify that the payouts side's movements net to the same figure as the payouts balance.
 
@@ -434,7 +450,7 @@ The API is versioned in the path (`/v1/…`). Breaking changes require a new ver
 
 - **Domain unit tests**: property-based tests that any sequence of payment / fee / refund / chargeback / payout / funding / resolution operations leaves every entry balanced and invariants 1, 2 and 5 intact; fee rounding edge cases; state machine transitions; funding-need computation.
 - **Integration tests** (Testcontainers PostgreSQL): idempotency key behaviour; two concurrent payout requests for the same payee, exactly one succeeds; reconciliation against recorded Billing Movements fixtures covering late fees, unknown purchases, console refunds, funding transfers seen on both sides, on one side only, and unrequested, status changes inside the overlap window; append-only enforcement; tenant isolation (a key never sees another marketplace's rows).
-- **Bamboo clients**: contract tests against recorded stage responses. An opt-in smoke test against Bamboo stage, excluded from CI.
+- **Bamboo clients**: contract tests against recorded responses (real production shapes from §2.1, with merchant identifiers and amounts anonymized before committing). An opt-in smoke test against Bamboo stage, excluded from CI.
 - **Webhooks**: valid and invalid signatures, replay, outbound retry and dead-lettering.
 
 ## 15. Out of scope for v1
@@ -448,9 +464,8 @@ The API is versioned in the path (`/v1/…`). Breaking changes require a new ver
 
 ## 16. Open questions for Bamboo
 
-1. Whether `TrafficFee` movements always carry the purchase's `TransactionId`, and how long after the purchase they can appear.
-2. Whether chargeback fees appear as separate Billing Movements rows and under which `Type`.
-3. Exact HMAC header names and string-to-sign for the transaction, chargeback and payout webhooks in the current API version, and which key signs payout webhooks.
-4. Exact `Type` values on the payouts account's Billing Movements for the incoming transfer, the payout itself and the payout fee, and whether the payout debit carries our `reference`.
-5. Whether `AvailableDate` varies by payment method within a country and whether it can change after the movement is created.
-6. Whether a refund made from the Merchant Console triggers the transaction webhook or only appears in Billing Movements.
+1. Whether chargeback fees appear as separate Billing Movements rows and under which `Type`.
+2. Exact HMAC header names and string-to-sign for the transaction, chargeback and payout webhooks in the current API version, and which key signs payout webhooks.
+3. Exact `Type` values on the payouts account's Billing Movements for the incoming transfer, the payout itself and the payout fee, and whether the payout debit carries our `reference`.
+4. Whether `Availabledate` can change after the movement is created, and whether T+4 (observed in Peru) differs by country.
+5. Whether a refund made from the Merchant Console triggers the transaction webhook or only appears in Billing Movements.
