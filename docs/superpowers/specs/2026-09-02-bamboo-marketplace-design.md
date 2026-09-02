@@ -27,7 +27,7 @@ The service is **not PCI compliant** and never touches card data. Card capture h
 - Payments land in the payins account. Once Bamboo settles them, they become available there.
 - Moving money from the payins account to the payouts account is a **manual operation performed by Bamboo's team**, on request. There is no API for it.
 - All payouts, to sub-merchants and to the marketplace, are executed from the payouts account.
-- Billing Movements (the merchant-side ledger) is a separate reporting API with its own credentials, issued by Bamboo's Technical Account Manager.
+- Billing Movements (Bamboo's account-side ledger) can be queried for **each account**, payins and payouts, per country, using that account's own credentials. So the service sees both sides of every movement, including the manual transfer and payout fees.
 
 Everything in this design follows from those facts.
 
@@ -64,13 +64,13 @@ tests/
 docs/                               MkDocs site
 ```
 
-Dependency direction: Api → Domain ← Infrastructure. Domain has no reference to EF Core, HTTP or Bamboo. Bamboo is behind three interfaces: `IBambooPayinsClient`, `IBambooPayoutsClient` and `IBambooReportingClient` (Billing Movements). Every client call takes the `BambooAccount` whose credentials it must use.
+Dependency direction: Api → Domain ← Infrastructure. Domain has no reference to EF Core, HTTP or Bamboo. Bamboo is behind three interfaces: `IBambooPayinsClient`, `IBambooPayoutsClient` and `IBambooReportingClient` (Billing Movements, callable against either the payins or the payouts account). Every client call takes the `BambooAccount` and side whose credentials it must use.
 
 ### 4.1 Tenancy
 
 ```
 Marketplace 1──* ApiKey
-Marketplace 1──* BambooAccount (one per country: payins creds, payouts creds, reporting creds)
+Marketplace 1──* BambooAccount (one per country: payins creds, payouts creds)
 Marketplace 1──* MarketplaceBeneficiary (one per country)
 Marketplace 1──* SubMerchant 1──1 Beneficiary
 Marketplace 1──* Customer 1──* Card (token reference only)
@@ -83,7 +83,7 @@ Marketplace 1──* OutboundEvent
 ```
 
 - **Marketplace** is the tenant. Fields: name, environment (`stage` | `production`), outbound webhook URL and secret, reconciliation grace period (default 3 days), payout schedule for its own balance, status.
-- **BambooAccount**: `(marketplace, country)`. Holds the payins credentials (private key, public key), the payouts credentials (private key, digital signature) and the reporting credentials, all encrypted. Also the Bamboo merchant/account identifiers as they appear in Billing Movements, so mirrored rows can be attributed. A country without an account cannot take payments.
+- **BambooAccount**: `(marketplace, country)`. Holds the payins credentials (private key, public key) and the payouts credentials (private key, digital signature), encrypted. Billing Movements is queried with each side's own credentials. Also the Bamboo merchant/account identifiers as they appear in Billing Movements, so mirrored rows can be attributed. A country without an account cannot take payments.
 - **MarketplaceBeneficiary**: the marketplace's own bank account per country, so its commission can be paid out from that country's payouts account.
 - **ApiKey**: many per marketplace for rotation. Stored as SHA-256 hash plus a visible prefix (`mk_live_a1b2…`). The plaintext is returned exactly once at creation. A separate admin key (`adm_…`) configured through environment is the only principal allowed on `/admin/*`.
 - **SubMerchant**: name, `externalId` (marketplace's own identifier, unique per marketplace), country, currency, fee policy, payout schedule, status (`active` | `paused` | `closed`). `paused` accepts payments but generates no payouts. `closed` accepts nothing new.
@@ -153,6 +153,9 @@ Dr `P.available` · Cr `P.reserved`
 **`payout.completed`**
 Dr `P.reserved` · Cr `bamboo.payouts`
 
+**`payout.bamboo_fee`** (from the payouts account's Billing Movements, one per payout)
+Cr `bamboo.payouts` · Dr `P.available` if `payoutFeeBearer = payee`, **or** Dr `marketplace.available` if the marketplace bears it. For marketplace payouts the marketplace always bears it.
+
 **`payout.failed`** / **`payout.cancelled`**
 Dr `P.reserved` · Cr `P.available`
 
@@ -179,6 +182,7 @@ FeePolicy {
   bambooFeeBearer: submerchant | marketplace
   refundCommission: bool
   chargebackFeeBearer: submerchant | marketplace
+  payoutFeeBearer: submerchant | marketplace
 }
 ```
 
@@ -199,7 +203,7 @@ Checked by the reconciliation job and by tests, per `(marketplace, country, curr
 Computed from entries, never stored as balances:
 
 - **Commission earned**: sum of `marketplace.pending` credits in `payment.approved` minus reversals in refunds/chargebacks.
-- **Bamboo fees**: sum of `payment.bamboo_fee` and `manual.fee_adjustment` amounts, split by bearer.
+- **Bamboo fees**: sum of `payment.bamboo_fee`, `payout.bamboo_fee` and `manual.fee_adjustment` amounts, split by bearer and by side (payins/payouts).
 - **Chargeback losses**: sum of `chargeback.received` amounts by bearer.
 
 Exposed on `GET /reports/…` with date filters.
@@ -217,13 +221,15 @@ Refunds: `POST /payments/{id}/refunds` calls Bamboo Refund, records the refund, 
 
 ## 7. Reconciliation
 
-Runs per Bamboo account, hourly by default. Requires the account's Billing Movements credentials. Without them, nothing is ever released automatically and the marketplace sees `RECONCILIATION_CREDENTIALS_MISSING` for that country on its status endpoint.
+Runs per Bamboo account, hourly by default, once against the payins side and once against the payouts side, each with its own credentials.
 
 Four idempotent steps:
 
-**Step 1 — Mirror.** Fetch Billing Movements from `watermark − 72h` to now, paginated. Upsert each row into `bamboo_movements` keyed by `(account_id, MovementId)`. Raw, uninterpreted. The overlap exists because `Status` and `Withdrawal_Status` change after creation.
+**Step 1 — Mirror.** For each side, fetch Billing Movements from `watermark − 72h` to now, paginated. Upsert each row into `bamboo_movements` keyed by `(account_id, side, MovementId)`. Raw, uninterpreted. The overlap exists because `Status` and `Withdrawal_Status` change after creation.
 
-**Step 2 — Match.** For each new or changed movement:
+**Step 2 — Match.** For each new or changed movement.
+
+Payins side:
 
 | Type | Match by | On match | On no match |
 |---|---|---|---|
@@ -231,11 +237,21 @@ Four idempotent steps:
 | `TrafficFee` | `TransactionId` → payment | post `payment.bamboo_fee` (once per MovementId) | issue `unmatched_fee` |
 | `Refund` | `TransactionId` → refund | mark confirmed | post `suspense.debit`, issue `unmatched_debit` |
 | `Chargeback` | `TransactionId` → chargeback | mark confirmed | post `suspense.debit`, issue `unmatched_debit` |
-| `Withdrawal` | see §7.3 | post `funding.recorded` | post `suspense.debit`, issue `unmatched_debit` |
+| `Withdrawal` (debit) | see §7.3 | half of a funding transfer | see §7.3 |
+
+Payouts side:
+
+| Type | Match by | On match | On no match |
+|---|---|---|---|
+| incoming credit (funding) | see §7.3 | other half of a funding transfer | see §7.3 |
+| payout debit | `ReferenceId`/`TransactionId` → payout | mark confirmed | post `suspense.debit` against `bamboo.payouts`, issue `unmatched_debit` |
+| payout fee | → payout | post `payout.bamboo_fee` (once per MovementId) | issue `unmatched_fee` |
+
+Bamboo's exact `Type` values on the payouts side are open question 4 in §16; the mapping is configuration, not code.
 
 **Step 3 — Release.** A payment moves `pending → available` (entry `payment.released`) only when all three hold: confirmed by Bamboo in Billing Movements, its fee entry exists, and `AvailableDate ≤ now`. If `AvailableDate + grace period` has passed and any condition is still false, open issue `release_blocked` with the exact missing condition. Nothing is released without evidence.
 
-**Step 4 — Check.** Query both Bamboo balances for the account and compare against the ledger: invariants 2, 3 and 4 from §5.5. Any difference opens `balance_mismatch` with the delta and both figures.
+**Step 4 — Check.** Query both Bamboo balances for the account and compare against the ledger: invariants 2, 3 and 4 from §5.5. Any difference opens `balance_mismatch` with the delta and both figures. Also verify that the payouts side's movements net to the same figure as the payouts balance.
 
 ### 7.1 Reconciliation issues
 
@@ -248,8 +264,7 @@ Notified to the marketplace by webhook `reconciliation.issue.opened` and listabl
 | `release_with_fee { amount }` | posts `payment.bamboo_fee` with the given amount and `payment.released`. When the real `TrafficFee` arrives later, posts `manual.fee_adjustment` for the difference. |
 | `assign_to_submerchant { subMerchantId }` | moves a suspense debit to that sub-merchant's `available`. |
 | `assign_to_marketplace` | moves a suspense debit to `marketplace.available`. |
-| `confirm_funding { fundingTransferId }` | matches an unmatched withdrawal to a funding transfer the marketplace requested. |
-| `assign_to_funding` | records an unmatched withdrawal as a funding transfer nobody requested: creates the `FundingTransfer` as `completed` and reverses the suspense debit into `funding.recorded`. |
+| `confirm_funding { fundingTransferId? }` | resolves a one-sided funding movement: attaches it to the given transfer, or creates one, and posts `funding.recorded`, reversing the suspense entry. |
 | `dismiss { reason }` | closes without entries. Reason is mandatory. |
 
 ### 7.2 Funding need
@@ -268,12 +283,13 @@ When it is positive, the marketplace sees it on `GET /status` and receives `fund
 
 A `FundingTransfer` is the marketplace's record of a request to Bamboo: `POST /funding-transfers { country, currency, amount }`, state `requested`. It is bookkeeping only; the service cannot trigger the movement.
 
-When reconciliation sees the transfer happen, it posts `funding.recorded` and marks the transfer `completed`. Two detection paths, in order:
+When reconciliation sees the transfer happen, it posts `funding.recorded` and marks the transfer `completed`. A transfer is evidenced by **both halves**: a withdrawal debit on the payins side and an incoming credit on the payouts side, same currency, same amount, close in time. Matching order:
 
-1. A `Withdrawal` movement in Billing Movements for that account and currency whose amount matches a `requested` transfer (exact match first, then the oldest requested transfer if amounts differ but the difference is under a configurable tolerance; the difference opens `funding_amount_mismatch`).
-2. If Billing Movements shows no withdrawal but Step 4 finds `bamboo.payins` down and `bamboo.payouts` up by the same amount, that shift is treated as the transfer.
+1. Both halves present and equal to a `requested` transfer's amount: match it (exact match first, then the oldest requested transfer within a configurable tolerance; any difference opens `funding_amount_mismatch`).
+2. Both halves present but no request: post `funding.recorded` anyway (the money moved, and both sides prove it), create the `FundingTransfer` as `completed` with `requested_by = bamboo`, and open `unrequested_funding` for information.
+3. Only one half present for longer than the grace period: post `suspense.debit` (payins) or hold the credit as `suspense` (payouts) and open `unmatched_debit` / `unmatched_credit`. The operator resolves with `confirm_funding`.
 
-A withdrawal that matches no request posts `suspense.debit` and opens `unmatched_debit`; the operator can attach it to a transfer with `confirm_funding` or record it as an unrequested funding with `assign_to_funding`. The `funding.recorded` entry is only ever posted from observed evidence.
+The `funding.recorded` entry is only ever posted from observed evidence on both sides of the transfer.
 
 ## 8. Payouts
 
@@ -300,7 +316,7 @@ All paths below are relative to `/v1`. Inbound Bamboo webhook paths are unversio
 | Method | Path | Purpose |
 |---|---|---|
 | POST/GET/PATCH | `/admin/marketplaces[/{id}]` | Tenants: name, environment, webhook URL and secret, grace period, own payout schedule |
-| POST/GET/PATCH/DELETE | `/admin/marketplaces/{id}/bamboo-accounts[/{country}]` | One per country: payins, payouts and reporting credentials, Bamboo identifiers |
+| POST/GET/PATCH/DELETE | `/admin/marketplaces/{id}/bamboo-accounts[/{country}]` | One per country: payins and payouts credentials, Bamboo identifiers |
 | POST/DELETE | `/admin/marketplaces/{id}/api-keys[/{keyId}]` | Issue and revoke marketplace keys |
 | GET/POST | `/admin/reconciliation/issues[/{id}/resolve]` | Cross-tenant issue list and resolution actions |
 
@@ -327,7 +343,7 @@ All paths below are relative to `/v1`. Inbound Bamboo webhook paths are unversio
 | GET | `/reports/commission`, `/reports/bamboo-fees`, `/reports/chargebacks` | Derived reports (§5.6), date-filtered |
 | GET | `/reconciliation/issues` | Own issues, read-only |
 | GET | `/events[/{id}]`, POST `/events/{id}/redeliver` | Outbound webhook log and manual redelivery |
-| GET | `/status` | Per country: credentials present, last reconciliation, open issue counts, `funding_needed` |
+| GET | `/status` | Per country: credentials present per side, last reconciliation per side, open issue counts, `funding_needed` |
 
 ### 9.3 Inbound webhooks from Bamboo
 
@@ -372,7 +388,7 @@ POST /payments
 { "error": { "code": "INSUFFICIENT_AVAILABLE", "message": "…", "details": {} } }
 ```
 
-Stable codes include `SUBMERCHANT_PAUSED`, `SUBMERCHANT_CLOSED`, `CURRENCY_MISMATCH`, `NO_BAMBOO_ACCOUNT_FOR_COUNTRY`, `CARD_NOT_FOUND`, `BENEFICIARY_INCOMPLETE`, `INSUFFICIENT_AVAILABLE`, `PAYOUT_NOT_CANCELLABLE`, `IDEMPOTENCY_KEY_REUSED`, `RECONCILIATION_CREDENTIALS_MISSING`, `BAMBOO_UNAVAILABLE`, `BAMBOO_REJECTED` (with Bamboo's code in `details`).
+Stable codes include `SUBMERCHANT_PAUSED`, `SUBMERCHANT_CLOSED`, `CURRENCY_MISMATCH`, `NO_BAMBOO_ACCOUNT_FOR_COUNTRY`, `CARD_NOT_FOUND`, `BENEFICIARY_INCOMPLETE`, `INSUFFICIENT_AVAILABLE`, `PAYOUT_NOT_CANCELLABLE`, `IDEMPOTENCY_KEY_REUSED`, `BAMBOO_UNAVAILABLE`, `BAMBOO_REJECTED` (with Bamboo's code in `details`).
 
 ## 10. Outbound webhooks
 
@@ -384,7 +400,7 @@ Each event is stored in `outbound_events` with a frozen payload, then delivered 
 
 | Job | Cadence | Purpose |
 |---|---|---|
-| Reconciliation | hourly per Bamboo account | §7, including funding detection and funding-need computation |
+| Reconciliation | hourly per Bamboo account, both sides | §7, including funding detection and funding-need computation |
 | Payout scheduler | hourly | §8, sub-merchants and marketplace |
 | Payout executor | every 5 min | move `approved` → `submitted` within country windows |
 | Payout status poller | every 15 min | fallback for missing payout webhooks |
@@ -408,7 +424,7 @@ Jobs are idempotent and safe to run concurrently across instances (Hangfire dist
 Public docs site in `docs/`, built with MkDocs Material and published with GitHub Pages:
 
 - Concepts: marketplaces, Bamboo accounts per country, sub-merchants, the ledger and the ownership model, availability, funding, reconciliation issues.
-- Guides: onboarding a marketplace (which Bamboo credentials to request and for which country), integrating the hosted tokenization form, taking a payment, handling webhooks, paying out, requesting funding from Bamboo.
+- Guides: onboarding a marketplace (payins and payouts credentials per country), integrating the hosted tokenization form, taking a payment, handling webhooks, paying out, requesting funding from Bamboo.
 - API reference: the OpenAPI document generated from the code at build time, rendered with an embedded reference viewer, so docs cannot drift from the implementation.
 - Operations: running locally, configuration, running reconciliation, resolving issues.
 
@@ -417,7 +433,7 @@ The API is versioned in the path (`/v1/…`). Breaking changes require a new ver
 ## 14. Testing
 
 - **Domain unit tests**: property-based tests that any sequence of payment / fee / refund / chargeback / payout / funding / resolution operations leaves every entry balanced and invariants 1, 2 and 5 intact; fee rounding edge cases; state machine transitions; funding-need computation.
-- **Integration tests** (Testcontainers PostgreSQL): idempotency key behaviour; two concurrent payout requests for the same payee, exactly one succeeds; reconciliation against recorded Billing Movements fixtures covering late fees, unknown purchases, console refunds, withdrawals matching and not matching funding requests, status changes inside the overlap window; append-only enforcement; tenant isolation (a key never sees another marketplace's rows).
+- **Integration tests** (Testcontainers PostgreSQL): idempotency key behaviour; two concurrent payout requests for the same payee, exactly one succeeds; reconciliation against recorded Billing Movements fixtures covering late fees, unknown purchases, console refunds, funding transfers seen on both sides, on one side only, and unrequested, status changes inside the overlap window; append-only enforcement; tenant isolation (a key never sees another marketplace's rows).
 - **Bamboo clients**: contract tests against recorded stage responses. An opt-in smoke test against Bamboo stage, excluded from CI.
 - **Webhooks**: valid and invalid signatures, replay, outbound retry and dead-lettering.
 
@@ -435,7 +451,6 @@ The API is versioned in the path (`/v1/…`). Breaking changes require a new ver
 1. Whether `TrafficFee` movements always carry the purchase's `TransactionId`, and how long after the purchase they can appear.
 2. Whether chargeback fees appear as separate Billing Movements rows and under which `Type`.
 3. Exact HMAC header names and string-to-sign for the transaction, chargeback and payout webhooks in the current API version, and which key signs payout webhooks.
-4. Whether the manual payins → payouts transfer appears in Billing Movements as a `Withdrawal` row, and with what `ReferenceId`, so §7.3 can match it deterministically.
+4. Exact `Type` values on the payouts account's Billing Movements for the incoming transfer, the payout itself and the payout fee, and whether the payout debit carries our `reference`.
 5. Whether `AvailableDate` varies by payment method within a country and whether it can change after the movement is created.
 6. Whether a refund made from the Merchant Console triggers the transaction webhook or only appears in Billing Movements.
-7. Whether Billing Movements credentials are issued per payins account (per country) or once per merchant.
