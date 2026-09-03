@@ -43,6 +43,14 @@ Facts taken from real responses, which override the public documentation where t
 - `Payment_method` and `Payment_media_brand` are sometimes swapped; neither is used for anything.
 - Minimum data latency is one hour.
 
+Payouts API facts observed in staging (details in `docs/superpowers/notes/2026-09-03-bamboo-sandbox-findings.md`):
+
+- `DigitalSignature` = HMAC SHA-256, lowercase hex, secret = **the payouts private key**, over the compact JSON `{"Country","Amount","Currency","Reference","Type"}` in that order.
+- Request `amount` is in minor units; `GET /api/Payout/{id}` returns `amount.value` in major units.
+- `POST /api/Payout` answers 200 for accepted (`status 5 Received`) and 409 with the same body for synchronous declines (`status 8`, `error.errorCode`).
+- Bank list `GET /api/Bank/country/{ISO}` supplies `bankCode` and `payoutType` (2 bank transfer, 3 wallet) per bank. Beneficiaries reference a bank from that list.
+- Status codes: 1 PAID, 2 PENDING, 3 PROCESSING, 4 REJECTED, 5 RECEIVED, 6 VALIDATED, 7 HELD, 8 DECLINED. Final: 1, 4, 8.
+
 Everything in this design follows from those facts.
 
 ## 3. Decisions taken
@@ -101,7 +109,7 @@ Marketplace 1──* OutboundEvent
 - **MarketplaceBeneficiary**: the marketplace's own bank account per country, so its commission can be paid out from that country's payouts account.
 - **ApiKey**: many per marketplace for rotation. Stored as SHA-256 hash plus a visible prefix (`mk_live_a1b2…`). The plaintext is returned exactly once at creation. A separate admin key (`adm_…`) configured through environment is the only principal allowed on `/admin/*`.
 - **SubMerchant**: name, `externalId` (marketplace's own identifier, unique per marketplace), country, currency, fee policy, payout schedule, status (`active` | `paused` | `closed`). `paused` accepts payments but generates no payouts. `closed` accepts nothing new.
-- **Beneficiary**: legal name or company name, document type and number, bank account (number, type, bank code, branch, optional SWIFT), email. Required fields depend on country and are validated by a per-country rule table before Bamboo is called.
+- **Beneficiary**: legal name or company name, document type and number, bank (a `bankCode` from Bamboo's bank list for the country, which also fixes the `payoutType`: bank transfer or wallet), account number or wallet phone, account type, email. Required fields depend on country and are validated by a per-country rule table before Bamboo is called. The bank list is cached per country and refreshed daily.
 - **Customer** belongs to the marketplace, not to a sub-merchant. A customer may pay any sub-merchant of that marketplace with the same stored card. Fields: `externalId`, email, Bamboo customer id per country (Bamboo customers live inside a payins account).
 
 Every table carries `marketplace_id`. The auth middleware resolves the marketplace from the API key and every repository query is scoped by it. There is no code path that reads another tenant's rows.
@@ -316,7 +324,7 @@ States: `pending_approval → approved → submitted → completed | failed`; `c
 - **Scheduler** (hourly): for each `active` sub-merchant, and for the marketplace in each country where it has a beneficiary, whose schedule is due, with `available ≥ minimumAmount` and no payout in `approved`/`submitted`, create a payout for the full available balance. State is `approved` if `autoApprove`, else `pending_approval`.
 - **Creation** (scheduler or `POST /payouts`) locks the payee row (`SELECT … FOR UPDATE`), verifies `available ≥ amount`, posts `payout.created`. Insufficient funds → 409 `INSUFFICIENT_AVAILABLE`. Missing beneficiary → 422 `BENEFICIARY_INCOMPLETE`.
 - **Execution** (`approved → submitted`, every 5 minutes): check the payouts account balance at Bamboo; if insufficient, leave `approved`, open issue `payout_funds_insufficient` and let §7.2 raise the funding need. Respect the country's processing window (e.g. Uruguay business days 10:00–16:30 UTC−3) as configuration; outside it, wait for the next run. Call Create Payout with `reference = payout.id` (Bamboo's idempotency field) and `notification_Url` back to the service. Store Bamboo's `payoutId`.
-- **Completion** by Bamboo's payout webhook, with a fallback poller every 15 minutes for `submitted` payouts older than one hour. `completed` posts `payout.completed`. `failed` posts `payout.failed` and stores Bamboo's error code and description.
+- **Completion** by Bamboo's payout webhook, with a fallback poller every 15 minutes for `submitted` payouts older than one hour. Bamboo status 1 (PAID) → `completed`, posts `payout.completed`. Bamboo 4 (REJECTED) or 8 (DECLINED) → `failed`, posts `payout.failed` and stores Bamboo's error code and description. Bamboo 2, 3, 5, 6 keep `submitted`; 7 (HELD) keeps `submitted` and opens issue `payout_held` so a human knows compliance is reviewing it. A synchronous 409 with status 8 at creation is a `failed` payout that never left `submitted`.
 - **Cancellation** allowed in `pending_approval` and `approved`; posts `payout.cancelled`.
 
 ## 9. API
@@ -465,7 +473,8 @@ The API is versioned in the path (`/v1/…`). Breaking changes require a new ver
 ## 16. Open questions for Bamboo
 
 1. Whether chargeback fees appear as separate Billing Movements rows and under which `Type`.
-2. Exact HMAC header names and string-to-sign for the transaction, chargeback and payout webhooks in the current API version, and which key signs payout webhooks.
+2. Exact header names carrying the signature and `dateSent` on the payins transaction and chargeback webhooks (the string to sign is documented; the header names are not).
+6. Staging enablement: a payment method on the payins account, the payouts business model on the payouts account, and how to read the payouts account balance (see the sandbox findings note).
 3. Exact `Type` values on the payouts account's Billing Movements for the incoming transfer, the payout itself and the payout fee, and whether the payout debit carries our `reference`.
 4. Whether `Availabledate` can change after the movement is created, and whether T+4 (observed in Peru) differs by country.
 5. Whether a refund made from the Merchant Console triggers the transaction webhook or only appears in Billing Movements.
