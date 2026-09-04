@@ -57,6 +57,12 @@ Bamboo supplied a different staging merchant key with Yape and cards enabled, pl
 - **Card vs Yape**: identical fee structure on this account (3% `TrafficFee`, ~10% `EfExSpread`, `Availabledate = Created + 20 days`).
 - **Rounding.** Sum of today's movements: +2300 USD cents net. Balance moved from 222.2258 to 245.1855 = +22.9597. Difference 0.0403 USD across five transactions: Bamboo keeps sub-cent FX fractions in the balance while movements are whole cents. Reconciliation tolerance must scale with the number of movements, not be a flat one cent.
 
+### Payout `reference` is not enforced as unique by the API
+
+`POST /api/Payout` accepted the same `reference` three times (twice in one account, once in another), returning a new `payoutId` each time. `GET /api/Payout/reference/{ref}` then returned only the first one. The declined state of the earlier payout may be what allowed the repeat (uniqueness might apply only to live payouts), but the service cannot rely on that. Consequences: our own idempotency is the only real guard; after a timeout on create, look up by reference before retrying, and never treat "same reference" as "same payout". Declined payouts are returned by both `GET by id` and `GET by reference`.
+
+The Merchant Console's bulk upload, by contrast, rejects rows whose `Reference` already exists in that console's account with the message "Referencia repetida", for every row of the file.
+
 ## Payins webhooks (from docs, not yet observed)
 
 - Transaction webhook: signed with HMAC SHA-256 over `PurchaseId + Amount + Currency + utcNow`, where `utcNow` comes from a `dateSent` header; the signature travels in a header whose name the public docs do not state. Retries: 15m, 30m, 1h, 3h, 6h.
