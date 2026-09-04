@@ -20,7 +20,7 @@ Authentication everywhere: `Authorization: Basic <private key>` (the raw key aft
 - `POST /Purchase/{id}/Refund` with `{Amount}` for full or partial refunds; only `APPROVED` purchases are refundable.
 - `GET /Merchant/balance` works with the payins key and returns `{BalanceSummary: [...]}`. In staging the figure is a placeholder (`9999999 USD`).
 - `GET /Reporting/billing-movements` works with the payins key. Staging had zero rows in 90 days.
-- In this sandbox merchant account, cards are disabled (`TK014 The payment method is disabled` on both the PCI purchase and direct tokenization) and Yape returns `TK007 The payment method does not match the expected` for both `YAP` (OTP) and `YOS` (OneShot). No purchase could be created. Ask Bamboo to enable at least one method in staging.
+- In this sandbox merchant account, cards are disabled (`TK014 The payment method is disabled` on both the PCI purchase and direct tokenization) and Yape returns `TK007` ("payment method ID not valid for the selected country") for both `YAP` (OTP) and `YOS` (OneShot), including with the Yape test phone and OTP supplied by Bamboo. The errors are identical for every `TargetCountryISO` tried (PE, UY, MX, AR, CL, CO, BR, EC) and for every body shape, so the account simply has no payment method enabled in staging. No purchase could be created. `Purchase/Preview` fails the same way, so it cannot be used to discover enabled methods.
 
 ## Payouts
 
