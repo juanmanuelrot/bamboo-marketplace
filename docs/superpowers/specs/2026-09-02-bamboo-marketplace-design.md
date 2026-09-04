@@ -37,8 +37,9 @@ Facts taken from real responses, which override the public documentation where t
 
 - **Merchant balance** returns `{ "BalanceSummary": [ { Currency, TotalSettlement, TotalAvailable, TotalProcessing } ] }` with amounts as **decimals in major units with 4 decimal places** (e.g. `559.6822`). `TotalSettlement` is money settled but not yet available; `TotalAvailable` is payable now. Rounding noise exists (`TotalAvailable: -0.0035`).
 - **Billing Movements** returns `{ "Response": { Data, Page, PageSize, Total }, "Errors" }` with amounts as **integer minor units** (`2000` = 20.00 PEN), debits negative. Field casing differs from the docs (`Transactionid`, `Movementid`, `Availabledate`, `Referenceid`, `Exchangerate`): deserialization must be case-insensitive.
-- Every approved purchase produces **one `Purchase` credit row and two `TrafficFee` debit rows** (a fixed component and a percentage component), all sharing the purchase's `Transactionid` and `Created`, all with the same `Availabledate`.
-- `Availabledate` was `Created + 4 calendar days` for Yape, debit and credit card alike.
+- Every approved purchase produces **one `Purchase` credit row plus one or more debit rows** sharing the purchase's `Transactionid`, `Created` and `Availabledate`. In the production Peru account those were two `TrafficFee` rows (a fixed and a percentage component). In a staging account that settles in USD they were one `TrafficFee` row (3%) and one **`EfExSpread`** row (FX spread, ~10%). The set of debit types and their sizes is an account property; the ledger posts whatever rows appear.
+- `Availabledate` was `Created + 4 calendar days` in the production Peru account (Yape, debit and credit card alike) and `Created + 20 days` in the USD-settling staging account. The window is an account property, not a country constant.
+- **Settlement currency can differ from the purchase currency.** A purchase of 25.00 PEN on a USD-settling account appears in Billing Movements as a `Purchase` of 7.45 USD with `Exchangerate` 3.35. The purchase API itself only reports the PEN amount. See §5.7.
 - `Referenceid` is empty; the merchant's `Order` does not appear in Billing Movements. Matching is by `Transactionid` only.
 - `Payment_method` and `Payment_media_brand` are sometimes swapped; neither is used for anything.
 - Minimum data latency is one hour.
@@ -232,6 +233,15 @@ Computed from entries, never stored as balances:
 
 Exposed on `GET /reports/…` with date filters.
 
+### 5.7 Settlement currency
+
+Each Bamboo account has a **settlement currency** (configured on the `BambooAccount`, verified against the `Currency` of its Billing Movements rows). The ledger for that account is kept in the settlement currency, because that is the currency in which the money actually exists at Bamboo and in which payouts are funded.
+
+- **Local accounts** (settlement currency = purchase currency, the normal case for a local marketplace): `payment.approved` is posted immediately at approval, as in §5.3.
+- **Cross-border accounts** (settlement currency ≠ purchase currency): the settled gross is unknown at approval, so `payment.approved` is posted when the `Purchase` row appears in Billing Movements, using its `Amount` and `Exchangerate`. Until then the payment is `approved` for the marketplace but shows `settlement: pending` and contributes to nobody's balance. Commission is computed on the settled gross in the settlement currency. The payment stores both the original amount/currency and the settled amount/currency/rate.
+
+Sub-merchants inherit the settlement currency of their country's account; a sub-merchant's `currency` field is therefore derived, not chosen. The API reports both currencies on every payment so the marketplace can show customers the original amount and sellers the settled one.
+
 ## 6. Payments flow
 
 1. Marketplace calls `POST /payments` with sub-merchant, amount, currency, customer, method and either a `card_id` or method-specific data. Country is the sub-merchant's; the payins account is the one for that country.
@@ -241,7 +251,7 @@ Exposed on `GET /reports/…` with date filters.
 5. Bamboo's transaction webhook arrives at `POST /webhooks/bamboo/{accountId}/transactions`. The service verifies the HMAC signature, returns 200, enqueues processing, then re-fetches the purchase by `Order` from Bamboo and applies the final status. The unique index on `(source_type, source_id)` makes the webhook and the synchronous path idempotent with respect to each other.
 6. Timeouts after a request was sent: the payment stays `processing` and a job polls Get Purchase by Order every minute for 30 minutes, then hourly for 24 hours, then raises `payment_unresolved`.
 
-Refunds: `POST /payments/{id}/refunds` calls Bamboo Refund, records the refund, posts `refund.completed` when Bamboo confirms (synchronously or by webhook). Chargebacks arrive only by webhook and post `chargeback.received`.
+Refunds: `POST /payments/{id}/refunds` calls Bamboo Refund, which answers `Status: PENDING` (`AuthorizationCode: DeferredRefundPending`) with the refund's own `TransactionId`; the refund is recorded as `pending`. Bamboo resolves it asynchronously (observed within a minute in staging). The service learns the final status from the transaction webhook or from polling `GET /transaction/{refundTransactionId}` (which returns `Type: REFUND`), and posts `refund.completed` on `APPROVED`. Chargebacks arrive only by webhook and post `chargeback.received`.
 
 ## 7. Reconciliation
 
@@ -257,8 +267,9 @@ Payins side:
 
 | Type | Match by | On match | On no match |
 |---|---|---|---|
-| `Purchase` (Approved) | `TransactionId` → payment | store `AvailableDate`, mark `confirmed_by_bamboo` | issue `unmatched_purchase` |
-| `TrafficFee` | `TransactionId` → payment | post `payment.bamboo_fee` (once per MovementId) | issue `unmatched_fee` |
+| `Purchase` (Approved) | `TransactionId` → payment | store `AvailableDate`, settled amount and rate; mark `confirmed_by_bamboo`; on cross-border accounts post `payment.approved` now (§5.7) | issue `unmatched_purchase` |
+| fee-type debit (`TrafficFee`, `EfExSpread`, and any type listed in the account's fee-types configuration) | `TransactionId` → payment | post `payment.bamboo_fee` (once per MovementId, tagged with the Bamboo type) | issue `unmatched_fee` |
+| any other debit type sharing a payment's `TransactionId` | `TransactionId` → payment | post `suspense.debit`, issue `unknown_movement_type` so an operator classifies it and the type is added to configuration | issue `unmatched_debit` |
 | `Refund` | `TransactionId` → refund | mark confirmed | post `suspense.debit`, issue `unmatched_debit` |
 | `Chargeback` | `TransactionId` → chargeback | mark confirmed | post `suspense.debit`, issue `unmatched_debit` |
 | `Withdrawal` (debit) | see §7.3 | half of a funding transfer | see §7.3 |

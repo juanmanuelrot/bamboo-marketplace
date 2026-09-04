@@ -36,6 +36,18 @@ Authentication everywhere: `Authorization: Basic <private key>` (the raw key aft
 - Status codes: 1 PAID (final), 2 PENDING, 3 PROCESSING, 4 REJECTED (final), 5 RECEIVED, 6 VALIDATED, 7 HELD (manual compliance review), 8 DECLINED (final).
 - Payout webhook payload mirrors `GET /api/Payout/{id}` plus `payoutType`. Signature: HMAC SHA-256 over `country + amount + currency + reference + payoutType + payoutId` with the private key.
 
+## 2026-09-04 — a second staging payins account, with methods enabled
+
+Bamboo supplied a different staging merchant key with Yape and cards enabled, plus Yape test data (phone `969929157`, OTP `557454`).
+
+- `POST /Purchase` with `PaymentMethod: "YAP"` and `MetaDataIn {phoneNumber, otp}` → `200 {TransactionId, Result: "COMPLETED", Status: "APPROVED", AuthorizationCode, Amount, Currency, Url: ".../v3/api/transaction/{id}", PaymentMethod: {Brand: "Yape", Type: "BankTransfer"}}`. Yape OTP is synchronous.
+- The PCI raw-card purchase on `secure-api.stage` also approved (VISA test card), after one transient `504 TR999 An error occurred while processing the workflow`. Retry on 5xx is mandatory.
+- `POST /Purchase/{id}/Refund {Amount: 500}` → `200 {TransactionId (new), Result: "COMPLETED", Status: "PENDING", AuthorizationCode: "DeferredRefundPending", Amount: -500}`. Thirty seconds later `GET /transaction/{refundId}` showed `Type: "REFUND", Status: "APPROVED"`. Refunds are asynchronous with a separate transaction id.
+- `GET /transaction/{id}` is a generic read for any transaction type and adds a `Type` field (`PURCHASE`, `REFUND`); `GET /Purchase/{id}` and `GET /Purchase/order/{order}` return the purchase shape without `Type`.
+- **This account settles in USD** although it charges in PEN. Its Billing Movements rows are all `Currency: "USD"` with `Exchangerate ≈ 3.35`; the merchant balance is in USD. A third movement type appears: **`EfExSpread`** (FX spread, Debit). Per purchase: one `Purchase` credit, one `TrafficFee` debit (3.0%, no fixed component), one `EfExSpread` debit (~10%). `Availabledate = Created + 20 days` (19 across a DST-free boundary once), not the 4 days of the production Peru account.
+- The same key authenticates on the payouts host and creates payouts (`status 5 Received`), but they are declined seconds later with `708 Invalid business model`, exactly like the dedicated payouts key. Payouts need an account with the payouts business model regardless of which key is used.
+- **Do not generalize from this.** Bamboo confirmed that in production the two accounts are strict: the payins account only takes payments and the payouts account only sends payouts. A staging key accepting calls on both hosts is a sandbox convenience. The design keeps two credential sets per country and never uses one for the other's operations.
+
 ## Payins webhooks (from docs, not yet observed)
 
 - Transaction webhook: signed with HMAC SHA-256 over `PurchaseId + Amount + Currency + utcNow`, where `utcNow` comes from a `dateSent` header; the signature travels in a header whose name the public docs do not state. Retries: 15m, 30m, 1h, 3h, 6h.
