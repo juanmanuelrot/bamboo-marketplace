@@ -48,6 +48,15 @@ Bamboo supplied a different staging merchant key with Yape and cards enabled, pl
 - The same key authenticates on the payouts host and creates payouts (`status 5 Received`), but they are declined seconds later with `708 Invalid business model`, exactly like the dedicated payouts key. Payouts need an account with the payouts business model regardless of which key is used.
 - **Do not generalize from this.** Bamboo confirmed that in production the two accounts are strict: the payins account only takes payments and the payouts account only sends payouts. A staging key accepting calls on both hosts is a sandbox convenience. The design keeps two credential sets per country and never uses one for the other's operations.
 
+### Today's transactions in Billing Movements (about 1.5 h later)
+
+- **Query window quirk.** With `To` = current UTC time the API returned zero rows for transactions created almost two hours earlier; with `To` = tomorrow it returned all 15. The `To` bound is evaluated against something ahead of UTC (or exclusive of the current day). Always query with `To` at least one day in the future.
+- **Latency.** The merchant balance reflected the purchases within seconds; Billing Movements showed them between one and two hours later.
+- **Refund rows.** The refund appears as `Type: "Refund"`, Debit, with the **refund's own `Transactionid`** (the one returned by `POST /Purchase/{id}/Refund`), not the purchase's. `Exchangerate` is `null` on the refund row. `Availabledate` equals the **original purchase's** `Availabledate`.
+- **Refunds carry fees.** The refund `Transactionid` also has its own `TrafficFee` (−4 USD cents on a 149-cent refund, 3%) and `EfExSpread` (−14, ~10%) rows. Refunding is not free; the ledger must post fee entries for refunds too.
+- **Card vs Yape**: identical fee structure on this account (3% `TrafficFee`, ~10% `EfExSpread`, `Availabledate = Created + 20 days`).
+- **Rounding.** Sum of today's movements: +2300 USD cents net. Balance moved from 222.2258 to 245.1855 = +22.9597. Difference 0.0403 USD across five transactions: Bamboo keeps sub-cent FX fractions in the balance while movements are whole cents. Reconciliation tolerance must scale with the number of movements, not be a flat one cent.
+
 ## Payins webhooks (from docs, not yet observed)
 
 - Transaction webhook: signed with HMAC SHA-256 over `PurchaseId + Amount + Currency + utcNow`, where `utcNow` comes from a `dateSent` header; the signature travels in a header whose name the public docs do not state. Retries: 15m, 30m, 1h, 3h, 6h.

@@ -167,6 +167,9 @@ The marketplace's commission on a payment becomes available at the same moment a
 **`refund.completed`** (full or partial, proportional)
 Cr `bamboo.payins` gross · Dr `submerchant.X.available` (falls back to `pending` if not yet released) net · Dr `marketplace.available` commission share if `refundCommission = true`, otherwise the sub-merchant bears that share too.
 
+**`refund.bamboo_fee`** (Bamboo charges processing fees on refunds too; one entry per fee row of the refund's transaction)
+Cr `bamboo.payins` · Dr the `bambooFeeBearer`'s `available` (or `pending` if the original payment is not yet released).
+
 **`chargeback.received`**
 Same shape as refund, plus the chargeback fee debited to `submerchant.X.*` or `marketplace.*` according to `chargebackFeeBearer`.
 
@@ -221,14 +224,14 @@ Checked by the reconciliation job and by tests, per `(marketplace, country, curr
 4. `bamboo.payouts` equals the payouts account balance Bamboo reports.
 5. `bamboo.payins + bamboo.payouts` = sum of all liability accounts.
 
-Bamboo balances are converted from 4-decimal major units to minor units and compared with a tolerance of 1 minor unit per currency, because Bamboo's own figures carry rounding noise.
+Bamboo balances are converted from 4-decimal major units to minor units and compared with a tolerance, because Bamboo keeps sub-cent fractions (notably from FX) in the balance while movements are whole minor units. Observed drift: about 0.8 minor units per movement. Default tolerance: 1 minor unit per movement mirrored for that account and currency, configurable per account. Drift beyond tolerance opens `balance_mismatch`; drift within tolerance is recorded on the check run so it can be trended.
 
 ### 5.6 Derived reports
 
 Computed from entries, never stored as balances:
 
 - **Commission earned**: sum of `marketplace.pending` credits in `payment.approved` minus reversals in refunds/chargebacks.
-- **Bamboo fees**: sum of `payment.bamboo_fee`, `payout.bamboo_fee` and `manual.fee_adjustment` amounts, split by bearer and by side (payins/payouts).
+- **Bamboo fees**: sum of `payment.bamboo_fee`, `refund.bamboo_fee`, `payout.bamboo_fee` and `manual.fee_adjustment` amounts, split by bearer, by Bamboo fee type and by side (payins/payouts).
 - **Chargeback losses**: sum of `chargeback.received` amounts by bearer.
 
 Exposed on `GET /reports/…` with date filters.
@@ -259,7 +262,7 @@ Runs per Bamboo account, hourly by default, once against the payins side and onc
 
 Four idempotent steps:
 
-**Step 1 — Mirror.** For each side, fetch Billing Movements from `watermark − 72h` to now, paginated. Upsert each row into `bamboo_movements` keyed by `(account_id, side, MovementId)`. Raw, uninterpreted. The overlap exists because `Status` and `Withdrawal_Status` change after creation.
+**Step 1 — Mirror.** For each side, fetch Billing Movements from `watermark − 72h` to `now + 1 day` (Bamboo's `To` bound excludes recent rows when set to the current instant), paginated. Upsert each row into `bamboo_movements` keyed by `(account_id, side, MovementId)`. Raw, uninterpreted. The overlap exists because `Status` and `Withdrawal_Status` change after creation.
 
 **Step 2 — Match.** For each new or changed movement.
 
@@ -270,7 +273,8 @@ Payins side:
 | `Purchase` (Approved) | `TransactionId` → payment | store `AvailableDate`, settled amount and rate; mark `confirmed_by_bamboo`; on cross-border accounts post `payment.approved` now (§5.7) | issue `unmatched_purchase` |
 | fee-type debit (`TrafficFee`, `EfExSpread`, and any type listed in the account's fee-types configuration) | `TransactionId` → payment | post `payment.bamboo_fee` (once per MovementId, tagged with the Bamboo type) | issue `unmatched_fee` |
 | any other debit type sharing a payment's `TransactionId` | `TransactionId` → payment | post `suspense.debit`, issue `unknown_movement_type` so an operator classifies it and the type is added to configuration | issue `unmatched_debit` |
-| `Refund` | `TransactionId` → refund | mark confirmed | post `suspense.debit`, issue `unmatched_debit` |
+| `Refund` | `TransactionId` → refund (the refund's own id, returned by Bamboo when it was created) | mark confirmed; store settled amount | post `suspense.debit`, issue `unmatched_debit` |
+| fee-type debit whose `TransactionId` is a refund's | `TransactionId` → refund | post `refund.bamboo_fee` (once per MovementId) | issue `unmatched_fee` |
 | `Chargeback` | `TransactionId` → chargeback | mark confirmed | post `suspense.debit`, issue `unmatched_debit` |
 | `Withdrawal` (debit) | see §7.3 | half of a funding transfer | see §7.3 |
 
